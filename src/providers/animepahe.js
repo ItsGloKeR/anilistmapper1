@@ -4,7 +4,7 @@ import { extractKwik } from '../extractors/kwik.js';
 
 export class AnimePahe {
   constructor() {
-    this.baseUrl = "https://animepahe.si";
+    this.baseUrl = "https://animepahe.com";
     this.sourceName = 'AnimePahe';
     this.isMulti = false;
   }
