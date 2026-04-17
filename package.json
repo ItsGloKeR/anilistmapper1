@@ -9,7 +9,7 @@
     "dev": "nodemon src/index.js"
   },
   "dependencies": {
-    "@consumet/extensions": "github:consumet/consumet.ts",
+    "@consumet/extensions": "npm:@consumet/extensions@1.8.1",
     "aniwatch": "^2.21.2",
     "axios": "^1.8.4",
     "cheerio": "^1.0.0",
