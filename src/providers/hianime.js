@@ -11,7 +11,7 @@ const MANUAL_MAP = {
     range: [0, 12] // First 12 episodes
   },
   // Season 3 Part 2 (AniList: 10 episodes)
-  '99147': {
+  '104578': {
     hianimeId: 'attack-on-titan-season-3-85', 
     range: [12, 22] // Skip first 12, take the next 10 (Total 22)
   },
