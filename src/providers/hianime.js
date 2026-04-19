@@ -3,6 +3,13 @@ import * as stringSimilarity from 'string-similarity-js';
 import { client } from '../utils/client.js';
 import { ANILIST_URL, ANILIST_QUERY, HIANIME_URL, ANIZIP_URL } from '../constants/api-constants.js';
 
+// --- ATTACK ON TITAN SPECIAL MAPPING ---
+const AOT_MAPPINGS = {
+  '99147': 'attack-on-titan-season-3-162', // S3 Part 2 (Anilist) -> S3 (HiAnime)
+  '146903': 'attack-on-titan-the-final-season-part-3-18329', // Final Chapters 1 -> S4 Part 3
+  '164244': 'attack-on-titan-the-final-season-part-3-18329', // Final Chapters 2 -> S4 Part 3
+};
+
 const TITLE_REPLACEMENTS = {
   'season': ['s', 'sz'],
   's': ['season', 'sz'],
@@ -24,7 +31,7 @@ const wordVariationsCache = new Map();
 
 const normalizeText = (text) => {
   return text.toLowerCase()
-    .replace(/(\d+)/g, ' $1 ') // Force space around numbers: "Rotten2" -> "rotten 2"
+    .replace(/(\d+)/g, ' $1 ') // Force space around numbers
     .replace(/[^\w\s]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -87,13 +94,10 @@ const calculateTitleScore = (searchTitle, hianimeTitle) => {
 
   if (normalizedSearch === normalizedTitle) return 1;
 
-  // --- Strict Number Check ---
-  // Extract trailing numbers or specific season markers
   const getTrailingNum = (t) => t.match(/\d+$/)?.[0];
   const searchNum = getTrailingNum(normalizedSearch);
   const titleNum = getTrailingNum(normalizedTitle);
 
-  // If one has a trailing number and the other doesn't (Season 1 vs Season 2), penalize heavily
   if (searchNum !== titleNum) return 0.2;
 
   const searchWords = normalizedSearch.split(' ');
@@ -111,14 +115,17 @@ const calculateTitleScore = (searchTitle, hianimeTitle) => {
 
   const wordMatchScore = matches / Math.max(searchWords.length, titleWords.length);
   const similarity = stringSimilarity.stringSimilarity(normalizedSearch, normalizedTitle);
-
-  // Penalty for significant length mismatch (prevents "Angel" matching "Angel Next Door")
   const lengthRatio = Math.min(searchWords.length, titleWords.length) / Math.max(searchWords.length, titleWords.length);
 
   return ((wordMatchScore * 0.6) + (similarity * 0.4)) * lengthRatio;
 };
 
 async function searchAnime(title, animeInfo) {
+  // Check if this is a known Attack on Titan problematic ID
+  if (AOT_MAPPINGS[animeInfo.id.toString()]) {
+    return AOT_MAPPINGS[animeInfo.id.toString()];
+  }
+
   try {
     let bestMatch = { score: 0, id: null };
     let seriesMatches = [];
@@ -139,26 +146,21 @@ async function searchAnime(title, animeInfo) {
         const hianimeTitle = el.text().trim();
         const hianimeId = el.attr('href')?.split('/').pop()?.split('?')[0];
         const isTV = $(item).find('.fd-infor .fdi-item').first().text().trim() === 'TV';
-        const episodesText = $(item).find('.tick-item.tick-eps').text().trim();
-        const episodesCount = episodesText ? parseInt(episodesText, 10) : 0;
+        const episodesCount = parseInt($(item).find('.tick-item.tick-eps').text().trim(), 10) || 0;
         
         if (hianimeId) {
           let score = calculateTitleScore(searchTitle, hianimeTitle);
-          
           if (isTV && animeInfo.episodes > 12) score += 0.05;
           if (animeInfo.episodes && episodesCount === animeInfo.episodes) score += 0.1;
 
           if (score > 0.4) {
-            seriesMatches.push({ title: hianimeTitle, id: hianimeId, score, isTV, episodes: episodesCount });
+            seriesMatches.push({ title: hianimeTitle, id: hianimeId, score });
           }
-          
           if (score > bestMatch.score) {
             bestMatch = { score, id: hianimeId };
           }
         }
       });
-
-      // Threshold raised to 0.95 to ensure we don't grab "Season 2" by mistake
       if (bestMatch.score > 0.95) return bestMatch.id;
     }
 
@@ -166,10 +168,8 @@ async function searchAnime(title, animeInfo) {
       seriesMatches.sort((a, b) => b.score - a.score);
       return seriesMatches[0].id;
     }
-
     return bestMatch.score > 0.5 ? bestMatch.id : null;
   } catch (error) {
-    console.error('Error searching Hianime:', error);
     return null;
   }
 }
@@ -179,7 +179,6 @@ async function getEpisodeIds(animeId, anilistId) {
     const episodeUrl = `${HIANIME_URL}/ajax/v2/episode/list/${animeId.split('-').pop()}`;
     const anizipUrl = `${ANIZIP_URL}?anilist_id=${anilistId}`;
 
-    // Use separate catch for Anizip so it doesn't break everything if it's down
     const [episodeResponse, anizipResponse] = await Promise.all([
       client.get(episodeUrl, {
         headers: { 'Referer': `${HIANIME_URL}/watch/${animeId}`, 'X-Requested-With': 'XMLHttpRequest' }
@@ -190,39 +189,54 @@ async function getEpisodeIds(animeId, anilistId) {
     if (!episodeResponse.data.html) return { totalEpisodes: 0, episodes: [] };
 
     const $ = load(episodeResponse.data.html);
-    const episodes = [];
+    let episodes = [];
     const anizipData = anizipResponse.data;
     
     $('#detail-ss-list div.ss-list a').each((i, el) => {
-      const $el = $(el);
-      const href = $el.attr('href');
-      if (!href) return;
-
-      const fullPath = href.split('/').pop();
-      const episodeNumber = i + 1;
-      const anizipEpisode = anizipData?.episodes?.[episodeNumber];
-      
-      if (fullPath) {
+      const href = $(el).attr('href');
+      if (href) {
         episodes.push({
-          episodeId: `${animeId}?ep=${fullPath.split('?ep=')[1]}`,
-          title: anizipEpisode?.title?.en || $el.attr('title') || '',
-          number: episodeNumber,
-          image: anizipEpisode?.image || null,
-          overview: anizipEpisode?.overview || null,
-          airDate: anizipEpisode?.airDate || null,
-          runtime: anizipEpisode?.runtime || null
+          episodeId: `${animeId}?ep=${href.split('?ep=')[1]}`,
+          title: $(el).attr('title') || '',
+          number: i + 1,
         });
       }
     });
 
+    // --- ATTACK ON TITAN SPECIFIC EPISODE FILTERING ---
+    // Season 3 Part 2 (Start from Ep 13 of HiAnime Season 3)
+    if (anilistId === 99147 && episodes.length > 12) {
+      episodes = episodes.slice(12).map((ep, idx) => ({ ...ep, number: idx + 1 }));
+    }
+    // Final Season Part 3 Special 1 (Take Ep 1 of HiAnime Part 3)
+    else if (anilistId === 146903) {
+      episodes = episodes.slice(0, 1);
+    }
+    // Final Season Part 3 Special 2 (Take Ep 2 of HiAnime Part 3)
+    else if (anilistId === 164244) {
+      episodes = episodes.slice(1, 2);
+    }
+
+    // Map AniZip data onto the (possibly filtered) episode list
+    const finalEpisodes = episodes.map(ep => {
+      const meta = anizipData?.episodes?.[ep.number];
+      return {
+        ...ep,
+        title: meta?.title?.en || ep.title,
+        image: meta?.image || null,
+        overview: meta?.overview || null,
+        airDate: meta?.airDate || null,
+        runtime: meta?.runtime || null
+      };
+    });
+
     return { 
-      totalEpisodes: episodes.length, 
-      episodes,
+      totalEpisodes: finalEpisodes.length, 
+      episodes: finalEpisodes,
       titles: anizipData?.titles || null,
       images: anizipData?.images || null
     };
   } catch (error) {
-    console.error('Error fetching episodes:', error);
     return { totalEpisodes: 0, episodes: [] };
   }
 }
@@ -233,8 +247,6 @@ export async function getEpisodesForAnime(anilistId) {
     if (!animeInfo) throw new Error('Could not fetch anime info from Anilist');
 
     const title = animeInfo.title.english || animeInfo.title.romaji;
-    if (!title) throw new Error('No title found');
-
     const hianimeId = await searchAnime(title, animeInfo);
     if (!hianimeId) throw new Error('Could not find anime on Hianime');
 
