@@ -3,11 +3,31 @@ import * as stringSimilarity from 'string-similarity-js';
 import { client } from '../utils/client.js';
 import { ANILIST_URL, ANILIST_QUERY, HIANIME_URL, ANIZIP_URL } from '../constants/api-constants.js';
 
-// --- ATTACK ON TITAN SPECIAL MAPPING ---
-const AOT_MAPPINGS = {
-  '99147': 'attack-on-titan-season-3-162', // S3 Part 2 (Anilist) -> S3 (HiAnime)
-  '146903': 'attack-on-titan-the-final-season-part-3-18329', // Final Chapters 1 -> S4 Part 3
-  '164244': 'attack-on-titan-the-final-season-part-3-18329', // Final Chapters 2 -> S4 Part 3
+// --- MANUAL MAPPING FOR ATTACK ON TITAN ---
+const AOT_MANUAL_MAP = {
+  // Season 3 Part 2
+  '99147': {
+    hianimeId: 'attack-on-titan-season-3-162',
+    slice: [12, 22], // Start at index 12 (Ep 13), end at index 22
+  },
+  // Final Season (Part 1)
+  '110277': {
+    hianimeId: 'attack-on-titan-the-final-season-1614',
+  },
+  // Final Season Part 2
+  '131681': {
+    hianimeId: 'attack-on-titan-the-final-season-part-2-17885',
+  },
+  // Final Chapters Special 1
+  '146903': {
+    hianimeId: 'attack-on-titan-the-final-season-part-3-18329',
+    slice: [0, 1], // Just the first episode
+  },
+  // Final Chapters Special 2
+  '164244': {
+    hianimeId: 'attack-on-titan-the-final-season-part-3-18329',
+    slice: [1, 2], // Just the second episode
+  }
 };
 
 const TITLE_REPLACEMENTS = {
@@ -18,20 +38,16 @@ const TITLE_REPLACEMENTS = {
   'three': ['3', 'iii'],
   'four': ['4', 'iv'],
   'part': ['pt', 'p'],
-  'episode': ['ep'],
-  'chapters': ['ch'],
-  'chapter': ['ch'],
   'first': ['1', 'i'],
   'second': ['2', 'ii'],
-  'third': ['3', 'iii'],
-  'fourth': ['4', 'iv']
+  'third': ['3', 'iii']
 };
 
 const wordVariationsCache = new Map();
 
 const normalizeText = (text) => {
   return text.toLowerCase()
-    .replace(/(\d+)/g, ' $1 ') // Force space around numbers
+    .replace(/(\d+)/g, ' $1 ')
     .replace(/[^\w\s]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -40,222 +56,124 @@ const normalizeText = (text) => {
 const getWordVariations = (word) => {
   const cacheKey = word.toLowerCase();
   if (wordVariationsCache.has(cacheKey)) return wordVariationsCache.get(cacheKey);
-
   const variations = new Set([word]);
   const normalized = normalizeText(word);
   variations.add(normalized);
-
   for (const [key, values] of Object.entries(TITLE_REPLACEMENTS)) {
-    if (normalized === key) {
-      values.forEach(v => variations.add(v));
-    } else if (values.includes(normalized)) {
+    if (normalized === key) values.forEach(v => variations.add(v));
+    else if (values.includes(normalized)) {
       variations.add(key);
       values.forEach(v => variations.add(v));
     }
   }
-
   const result = [...variations];
   wordVariationsCache.set(cacheKey, result);
   return result;
 };
 
-async function getAnimeInfo(anilistId) {
-  try {
-    const response = await client.post(ANILIST_URL, {
-      query: ANILIST_QUERY,
-      variables: { id: anilistId }
-    });
-
-    const animeData = response.data.data.Media;
-    if (!animeData) return null;
-
-    const allTitles = new Set([
-      ...(animeData.synonyms || []),
-      animeData.title.english,
-      animeData.title.romaji
-    ].filter(Boolean)
-     .filter(t => !(/[\u4E00-\u9FFF]/.test(t))));
-
-    return {
-      id: animeData.id,
-      title: animeData.title,
-      episodes: animeData.episodes,
-      synonyms: [...allTitles]
-    };
-  } catch (error) {
-    console.error('Error fetching anime info:', error);
-    return null;
-  }
-}
-
 const calculateTitleScore = (searchTitle, hianimeTitle) => {
-  const normalizedSearch = normalizeText(searchTitle);
-  const normalizedTitle = normalizeText(hianimeTitle);
+  const nSearch = normalizeText(searchTitle);
+  const nTitle = normalizeText(hianimeTitle);
+  if (nSearch === nTitle) return 1;
 
-  if (normalizedSearch === normalizedTitle) return 1;
+  const getNum = (t) => t.match(/\d+$/)?.[0];
+  if (getNum(nSearch) !== getNum(nTitle)) return 0.2;
 
-  const getTrailingNum = (t) => t.match(/\d+$/)?.[0];
-  const searchNum = getTrailingNum(normalizedSearch);
-  const titleNum = getTrailingNum(normalizedTitle);
-
-  if (searchNum !== titleNum) return 0.2;
-
-  const searchWords = normalizedSearch.split(' ');
-  const titleWords = normalizedTitle.split(' ');
-
-  const searchVariations = searchWords.map(w => getWordVariations(w));
-  const titleVariations = titleWords.map(w => getWordVariations(w));
-
+  const sWords = nSearch.split(' ');
+  const tWords = nTitle.split(' ');
   let matches = 0;
-  for (const sVars of searchVariations) {
-    if (titleVariations.some(tVars => tVars.some(v => sVars.includes(v)))) {
-      matches++;
-    }
+  for (const sVar of sWords.map(w => getWordVariations(w))) {
+    if (tWords.some(tW => sVar.includes(tW))) matches++;
   }
 
-  const wordMatchScore = matches / Math.max(searchWords.length, titleWords.length);
-  const similarity = stringSimilarity.stringSimilarity(normalizedSearch, normalizedTitle);
-  const lengthRatio = Math.min(searchWords.length, titleWords.length) / Math.max(searchWords.length, titleWords.length);
-
-  return ((wordMatchScore * 0.6) + (similarity * 0.4)) * lengthRatio;
+  const wordScore = matches / Math.max(sWords.length, tWords.length);
+  const similarity = stringSimilarity.stringSimilarity(nSearch, nTitle);
+  return ((wordScore * 0.6) + (similarity * 0.4)) * (Math.min(sWords.length, tWords.length) / Math.max(sWords.length, tWords.length));
 };
 
 async function searchAnime(title, animeInfo) {
-  // Check if this is a known Attack on Titan problematic ID
-  if (AOT_MAPPINGS[animeInfo.id.toString()]) {
-    return AOT_MAPPINGS[animeInfo.id.toString()];
+  // Apply Manual Map
+  if (AOT_MANUAL_MAP[animeInfo.id.toString()]) {
+    return AOT_MANUAL_MAP[animeInfo.id.toString()].hianimeId;
   }
 
   try {
     let bestMatch = { score: 0, id: null };
-    let seriesMatches = [];
+    const titles = [animeInfo.title.english, animeInfo.title.romaji, ...animeInfo.synonyms].filter(Boolean);
 
-    const titlesToTry = [
-      animeInfo.title.english,
-      animeInfo.title.romaji,
-      ...animeInfo.synonyms
-    ].filter(Boolean).filter((t, i, arr) => arr.indexOf(t) === i);
-
-    for (const searchTitle of titlesToTry) {
-      const searchUrl = `${HIANIME_URL}/search?keyword=${encodeURIComponent(searchTitle)}`;
-      const response = await client.get(searchUrl);
-      const $ = load(response.data);
-
-      $('.film_list-wrap > .flw-item').each((_, item) => {
-        const el = $(item).find('.film-detail .film-name a');
-        const hianimeTitle = el.text().trim();
-        const hianimeId = el.attr('href')?.split('/').pop()?.split('?')[0];
-        const isTV = $(item).find('.fd-infor .fdi-item').first().text().trim() === 'TV';
-        const episodesCount = parseInt($(item).find('.tick-item.tick-eps').text().trim(), 10) || 0;
-        
-        if (hianimeId) {
-          let score = calculateTitleScore(searchTitle, hianimeTitle);
-          if (isTV && animeInfo.episodes > 12) score += 0.05;
-          if (animeInfo.episodes && episodesCount === animeInfo.episodes) score += 0.1;
-
-          if (score > 0.4) {
-            seriesMatches.push({ title: hianimeTitle, id: hianimeId, score });
-          }
-          if (score > bestMatch.score) {
-            bestMatch = { score, id: hianimeId };
-          }
-        }
+    for (const t of titles) {
+      const res = await client.get(`${HIANIME_URL}/search?keyword=${encodeURIComponent(t)}`);
+      const $ = load(res.data);
+      $('.flw-item').each((_, item) => {
+        const el = $(item).find('.film-name a');
+        const hTitle = el.text().trim();
+        const hId = el.attr('href')?.split('/').pop()?.split('?')[0];
+        const score = calculateTitleScore(t, hTitle);
+        if (score > bestMatch.score) bestMatch = { score, id: hId };
       });
-      if (bestMatch.score > 0.95) return bestMatch.id;
-    }
-
-    if (seriesMatches.length > 0) {
-      seriesMatches.sort((a, b) => b.score - a.score);
-      return seriesMatches[0].id;
+      if (bestMatch.score > 0.95) break;
     }
     return bestMatch.score > 0.5 ? bestMatch.id : null;
-  } catch (error) {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function getEpisodeIds(animeId, anilistId) {
   try {
-    const episodeUrl = `${HIANIME_URL}/ajax/v2/episode/list/${animeId.split('-').pop()}`;
-    const anizipUrl = `${ANIZIP_URL}?anilist_id=${anilistId}`;
-
-    const [episodeResponse, anizipResponse] = await Promise.all([
-      client.get(episodeUrl, {
-        headers: { 'Referer': `${HIANIME_URL}/watch/${animeId}`, 'X-Requested-With': 'XMLHttpRequest' }
-      }),
-      client.get(anizipUrl).catch(() => ({ data: null }))
+    const epUrl = `${HIANIME_URL}/ajax/v2/episode/list/${animeId.split('-').pop()}`;
+    const [epRes, azRes] = await Promise.all([
+      client.get(epUrl, { headers: { 'Referer': `${HIANIME_URL}/watch/${animeId}`, 'X-Requested-With': 'XMLHttpRequest' } }),
+      client.get(`${ANIZIP_URL}?anilist_id=${anilistId}`).catch(() => ({ data: null }))
     ]);
 
-    if (!episodeResponse.data.html) return { totalEpisodes: 0, episodes: [] };
-
-    const $ = load(episodeResponse.data.html);
+    if (!epRes.data.html) return { totalEpisodes: 0, episodes: [] };
+    const $ = load(epRes.data.html);
     let episodes = [];
-    const anizipData = anizipResponse.data;
-    
-    $('#detail-ss-list div.ss-list a').each((i, el) => {
-      const href = $(el).attr('href');
-      if (href) {
-        episodes.push({
-          episodeId: `${animeId}?ep=${href.split('?ep=')[1]}`,
-          title: $(el).attr('title') || '',
-          number: i + 1,
-        });
-      }
+
+    $('a.ep-item').each((i, el) => {
+      episodes.push({
+        episodeId: `${animeId}?ep=${$(el).attr('href').split('?ep=')[1]}`,
+        number: i + 1,
+        title: $(el).attr('title') || `Episode ${i + 1}`
+      });
     });
 
-    // --- ATTACK ON TITAN SPECIFIC EPISODE FILTERING ---
-    // Season 3 Part 2 (Start from Ep 13 of HiAnime Season 3)
-    if (anilistId === 99147 && episodes.length > 12) {
-      episodes = episodes.slice(12).map((ep, idx) => ({ ...ep, number: idx + 1 }));
-    }
-    // Final Season Part 3 Special 1 (Take Ep 1 of HiAnime Part 3)
-    else if (anilistId === 146903) {
-      episodes = episodes.slice(0, 1);
-    }
-    // Final Season Part 3 Special 2 (Take Ep 2 of HiAnime Part 3)
-    else if (anilistId === 164244) {
-      episodes = episodes.slice(1, 2);
+    // --- APPLY AOT SLICING LOGIC ---
+    const mapping = AOT_MANUAL_MAP[anilistId.toString()];
+    if (mapping && mapping.slice) {
+      episodes = episodes.slice(mapping.slice[0], mapping.slice[1]);
+      // Reset numbers to 1, 2, 3... for the UI
+      episodes = episodes.map((ep, idx) => ({ ...ep, number: idx + 1 }));
     }
 
-    // Map AniZip data onto the (possibly filtered) episode list
     const finalEpisodes = episodes.map(ep => {
-      const meta = anizipData?.episodes?.[ep.number];
+      const meta = azRes.data?.episodes?.[ep.number];
       return {
         ...ep,
         title: meta?.title?.en || ep.title,
         image: meta?.image || null,
-        overview: meta?.overview || null,
-        airDate: meta?.airDate || null,
-        runtime: meta?.runtime || null
+        overview: meta?.overview || null
       };
     });
 
-    return { 
-      totalEpisodes: finalEpisodes.length, 
-      episodes: finalEpisodes,
-      titles: anizipData?.titles || null,
-      images: anizipData?.images || null
-    };
-  } catch (error) {
-    return { totalEpisodes: 0, episodes: [] };
-  }
+    return { totalEpisodes: finalEpisodes.length, episodes: finalEpisodes };
+  } catch { return { totalEpisodes: 0, episodes: [] }; }
 }
 
 export async function getEpisodesForAnime(anilistId) {
+  const animeInfo = await getAnimeInfo(anilistId);
+  if (!animeInfo) throw new Error('AniList fetch failed');
+  const hId = await searchAnime(animeInfo.title.english || animeInfo.title.romaji, animeInfo);
+  if (!hId) throw new Error('HiAnime ID not found');
+  const episodes = await getEpisodeIds(hId, anilistId);
+  return { anilistId, hianimeId: hId, title: animeInfo.title.english || animeInfo.title.romaji, ...episodes };
+}
+
+async function getAnimeInfo(id) {
   try {
-    const animeInfo = await getAnimeInfo(anilistId);
-    if (!animeInfo) throw new Error('Could not fetch anime info from Anilist');
-
-    const title = animeInfo.title.english || animeInfo.title.romaji;
-    const hianimeId = await searchAnime(title, animeInfo);
-    if (!hianimeId) throw new Error('Could not find anime on Hianime');
-
-    const episodes = await getEpisodeIds(hianimeId, anilistId);
-    return { anilistId, hianimeId, title, ...episodes };
-  } catch (error) {
-    console.error('Error in getEpisodesForAnime:', error);
-    throw error;
-  }
+    const res = await client.post(ANILIST_URL, { query: ANILIST_QUERY, variables: { id } });
+    const d = res.data.data.Media;
+    return d ? { id: d.id, title: d.title, episodes: d.episodes, synonyms: d.synonyms || [] } : null;
+  } catch { return null; }
 }
 
 export default { getEpisodesForAnime };
