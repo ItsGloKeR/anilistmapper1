@@ -3,15 +3,6 @@ import * as stringSimilarity from 'string-similarity-js';
 import { client } from '../utils/client.js';
 import { ANILIST_URL, ANILIST_QUERY, HIANIME_URL, ANIZIP_URL } from '../constants/api-constants.js';
 
-// --- MANUAL MAPPING (The Surgical Override for AOT) ---
-const MANUAL_MAP = {
-  '99146': { hianimeId: 'attack-on-titan-season-3-85', range: [0, 12] },
-  '104578': { hianimeId: 'attack-on-titan-season-3-85', range: [12, 22] },
-  '146903': { hianimeId: 'attack-on-titan-the-final-season-part-3-18329', range: [0, 1] },
-  '164244': { hianimeId: 'attack-on-titan-the-final-season-part-3-18329', range: [1, 2] }
-};
-
-// --- THE "OLD LOGIC" (Title Variations & Scoring) ---
 const TITLE_REPLACEMENTS = {
   'season': ['s', 'sz'],
   's': ['season', 'sz'],
@@ -32,11 +23,11 @@ const TITLE_REPLACEMENTS = {
 const wordVariationsCache = new Map();
 
 const normalizeText = (text) => {
-  return text?.toLowerCase()
-    .replace(/(\d+)/g, ' $1 ') 
+  return text.toLowerCase()
+    .replace(/(\d+)/g, ' $1 ') // Force space around numbers: "Rotten2" -> "rotten 2"
     .replace(/[^\w\s]/g, '')
     .replace(/\s+/g, ' ')
-    .trim() || '';
+    .trim();
 };
 
 const getWordVariations = (word) => {
@@ -48,16 +39,47 @@ const getWordVariations = (word) => {
   variations.add(normalized);
 
   for (const [key, values] of Object.entries(TITLE_REPLACEMENTS)) {
-    if (normalized === key) values.forEach(v => variations.add(v));
-    else if (values.includes(normalized)) {
+    if (normalized === key) {
+      values.forEach(v => variations.add(v));
+    } else if (values.includes(normalized)) {
       variations.add(key);
       values.forEach(v => variations.add(v));
     }
   }
+
   const result = [...variations];
   wordVariationsCache.set(cacheKey, result);
   return result;
 };
+
+async function getAnimeInfo(anilistId) {
+  try {
+    const response = await client.post(ANILIST_URL, {
+      query: ANILIST_QUERY,
+      variables: { id: anilistId }
+    });
+
+    const animeData = response.data.data.Media;
+    if (!animeData) return null;
+
+    const allTitles = new Set([
+      ...(animeData.synonyms || []),
+      animeData.title.english,
+      animeData.title.romaji
+    ].filter(Boolean)
+     .filter(t => !(/[\u4E00-\u9FFF]/.test(t))));
+
+    return {
+      id: animeData.id,
+      title: animeData.title,
+      episodes: animeData.episodes,
+      synonyms: [...allTitles]
+    };
+  } catch (error) {
+    console.error('Error fetching anime info:', error);
+    return null;
+  }
+}
 
 const calculateTitleScore = (searchTitle, hianimeTitle) => {
   const normalizedSearch = normalizeText(searchTitle);
@@ -65,9 +87,14 @@ const calculateTitleScore = (searchTitle, hianimeTitle) => {
 
   if (normalizedSearch === normalizedTitle) return 1;
 
-  // Strict Number Check
+  // --- Strict Number Check ---
+  // Extract trailing numbers or specific season markers
   const getTrailingNum = (t) => t.match(/\d+$/)?.[0];
-  if (getTrailingNum(normalizedSearch) !== getTrailingNum(normalizedTitle)) return 0.2;
+  const searchNum = getTrailingNum(normalizedSearch);
+  const titleNum = getTrailingNum(normalizedTitle);
+
+  // If one has a trailing number and the other doesn't (Season 1 vs Season 2), penalize heavily
+  if (searchNum !== titleNum) return 0.2;
 
   const searchWords = normalizedSearch.split(' ');
   const titleWords = normalizedTitle.split(' ');
@@ -77,141 +104,146 @@ const calculateTitleScore = (searchTitle, hianimeTitle) => {
 
   let matches = 0;
   for (const sVars of searchVariations) {
-    if (titleVariations.some(tVars => tVars.some(v => sVars.includes(v)))) matches++;
+    if (titleVariations.some(tVars => tVars.some(v => sVars.includes(v)))) {
+      matches++;
+    }
   }
 
   const wordMatchScore = matches / Math.max(searchWords.length, titleWords.length);
   const similarity = stringSimilarity.stringSimilarity(normalizedSearch, normalizedTitle);
+
+  // Penalty for significant length mismatch (prevents "Angel" matching "Angel Next Door")
   const lengthRatio = Math.min(searchWords.length, titleWords.length) / Math.max(searchWords.length, titleWords.length);
 
   return ((wordMatchScore * 0.6) + (similarity * 0.4)) * lengthRatio;
 };
 
-// --- ANILIST INFO (Including Assets) ---
-async function getAnimeInfo(anilistId) {
-  const query = `
-    query ($id: Int) {
-      Media (id: $id, type: ANIME) {
-        id
-        title { english romaji }
-        coverImage { extraLarge color }
-        bannerImage
-        synonyms
-        episodes
-        description
-      }
-    }
-  `;
-
-  try {
-    const response = await client.post(ANILIST_URL, { query, variables: { id: parseInt(anilistId) } });
-    const media = response.data.data.Media;
-    if (!media) return null;
-
-    const allTitles = new Set([
-      ...(media.synonyms || []),
-      media.title.english,
-      media.title.romaji
-    ].filter(Boolean).filter(t => !(/[\u4E00-\u9FFF]/.test(t))));
-
-    return {
-      id: media.id,
-      title: media.title,
-      banner: media.bannerImage,
-      cover: media.coverImage.extraLarge,
-      color: media.coverImage.color,
-      episodes: media.episodes,
-      synonyms: [...allTitles],
-      description: media.description
-    };
-  } catch { return null; }
-}
-
-// --- SEARCH & EPISODE LOGIC ---
 async function searchAnime(title, animeInfo) {
-  // Manual map check first
-  if (MANUAL_MAP[animeInfo.id.toString()]) return MANUAL_MAP[animeInfo.id.toString()].hianimeId;
-
   try {
     let bestMatch = { score: 0, id: null };
-    const titlesToTry = [animeInfo.title.english, animeInfo.title.romaji, ...animeInfo.synonyms]
-      .filter(Boolean).filter((t, i, arr) => arr.indexOf(t) === i);
+    let seriesMatches = [];
+
+    const titlesToTry = [
+      animeInfo.title.english,
+      animeInfo.title.romaji,
+      ...animeInfo.synonyms
+    ].filter(Boolean).filter((t, i, arr) => arr.indexOf(t) === i);
 
     for (const searchTitle of titlesToTry) {
-      const response = await client.get(`${HIANIME_URL}/search?keyword=${encodeURIComponent(searchTitle)}`);
+      const searchUrl = `${HIANIME_URL}/search?keyword=${encodeURIComponent(searchTitle)}`;
+      const response = await client.get(searchUrl);
       const $ = load(response.data);
 
-      $('.flw-item').each((_, item) => {
-        const el = $(item).find('.film-name a');
-        const hTitle = el.text().trim();
-        const hId = el.attr('href')?.split('/').pop()?.split('?')[0];
+      $('.film_list-wrap > .flw-item').each((_, item) => {
+        const el = $(item).find('.film-detail .film-name a');
+        const hianimeTitle = el.text().trim();
+        const hianimeId = el.attr('href')?.split('/').pop()?.split('?')[0];
+        const isTV = $(item).find('.fd-infor .fdi-item').first().text().trim() === 'TV';
+        const episodesText = $(item).find('.tick-item.tick-eps').text().trim();
+        const episodesCount = episodesText ? parseInt(episodesText, 10) : 0;
         
-        const score = calculateTitleScore(searchTitle, hTitle);
-        if (score > bestMatch.score) bestMatch = { score, id: hId };
+        if (hianimeId) {
+          let score = calculateTitleScore(searchTitle, hianimeTitle);
+          
+          if (isTV && animeInfo.episodes > 12) score += 0.05;
+          if (animeInfo.episodes && episodesCount === animeInfo.episodes) score += 0.1;
+
+          if (score > 0.4) {
+            seriesMatches.push({ title: hianimeTitle, id: hianimeId, score, isTV, episodes: episodesCount });
+          }
+          
+          if (score > bestMatch.score) {
+            bestMatch = { score, id: hianimeId };
+          }
+        }
       });
-      if (bestMatch.score > 0.95) break;
+
+      // Threshold raised to 0.95 to ensure we don't grab "Season 2" by mistake
+      if (bestMatch.score > 0.95) return bestMatch.id;
     }
+
+    if (seriesMatches.length > 0) {
+      seriesMatches.sort((a, b) => b.score - a.score);
+      return seriesMatches[0].id;
+    }
+
     return bestMatch.score > 0.5 ? bestMatch.id : null;
-  } catch { return null; }
+  } catch (error) {
+    console.error('Error searching Hianime:', error);
+    return null;
+  }
 }
 
-async function getEpisodeIds(hianimeId, anilistId) {
+async function getEpisodeIds(animeId, anilistId) {
   try {
-    const numericId = hianimeId.split('-').pop();
-    const [epRes, azRes] = await Promise.all([
-      client.get(`${HIANIME_URL}/ajax/v2/episode/list/${numericId}`, {
-        headers: { 'Referer': `${HIANIME_URL}/watch/${hianimeId}`, 'X-Requested-With': 'XMLHttpRequest' }
+    const episodeUrl = `${HIANIME_URL}/ajax/v2/episode/list/${animeId.split('-').pop()}`;
+    const anizipUrl = `${ANIZIP_URL}?anilist_id=${anilistId}`;
+
+    // Use separate catch for Anizip so it doesn't break everything if it's down
+    const [episodeResponse, anizipResponse] = await Promise.all([
+      client.get(episodeUrl, {
+        headers: { 'Referer': `${HIANIME_URL}/watch/${animeId}`, 'X-Requested-With': 'XMLHttpRequest' }
       }),
-      client.get(`${ANIZIP_URL}?anilist_id=${anilistId}`).catch(() => ({ data: null }))
+      client.get(anizipUrl).catch(() => ({ data: null }))
     ]);
 
-    if (!epRes.data.html) return { totalEpisodes: 0, episodes: [] };
-    const $ = load(epRes.data.html);
-    let allEpisodes = [];
+    if (!episodeResponse.data.html) return { totalEpisodes: 0, episodes: [] };
 
-    $('.ss-list a.ep-item').each((i, el) => {
-      const href = $(el).attr('href');
-      if (href && href.includes('?ep=')) {
-        allEpisodes.push({
-          episodeId: `${hianimeId}?ep=${href.split('?ep=')[1]}`,
-          title: $(el).attr('title') || `Episode ${i + 1}`
+    const $ = load(episodeResponse.data.html);
+    const episodes = [];
+    const anizipData = anizipResponse.data;
+    
+    $('#detail-ss-list div.ss-list a').each((i, el) => {
+      const $el = $(el);
+      const href = $el.attr('href');
+      if (!href) return;
+
+      const fullPath = href.split('/').pop();
+      const episodeNumber = i + 1;
+      const anizipEpisode = anizipData?.episodes?.[episodeNumber];
+      
+      if (fullPath) {
+        episodes.push({
+          episodeId: `${animeId}?ep=${fullPath.split('?ep=')[1]}`,
+          title: anizipEpisode?.title?.en || $el.attr('title') || '',
+          number: episodeNumber,
+          image: anizipEpisode?.image || null,
+          overview: anizipEpisode?.overview || null,
+          airDate: anizipEpisode?.airDate || null,
+          runtime: anizipEpisode?.runtime || null
         });
       }
     });
 
-    const mapEntry = MANUAL_MAP[anilistId.toString()];
-    const finalEpisodes = mapEntry?.range ? allEpisodes.slice(mapEntry.range[0], mapEntry.range[1]) : allEpisodes;
-
-    const episodesWithMeta = finalEpisodes.map((ep, idx) => {
-      const displayNum = idx + 1;
-      const meta = azRes.data?.episodes?.[displayNum];
-      return {
-        ...ep,
-        number: displayNum,
-        title: meta?.title?.en || ep.title,
-        image: meta?.image || null,
-        overview: meta?.overview || null
-      };
-    });
-
-    return { totalEpisodes: episodesWithMeta.length, episodes: episodesWithMeta };
-  } catch { return { totalEpisodes: 0, episodes: [] }; }
+    return { 
+      totalEpisodes: episodes.length, 
+      episodes,
+      titles: anizipData?.titles || null,
+      images: anizipData?.images || null
+    };
+  } catch (error) {
+    console.error('Error fetching episodes:', error);
+    return { totalEpisodes: 0, episodes: [] };
+  }
 }
 
 export async function getEpisodesForAnime(anilistId) {
-  const animeInfo = await getAnimeInfo(anilistId);
-  if (!animeInfo) throw new Error('AniList Data Failed');
+  try {
+    const animeInfo = await getAnimeInfo(anilistId);
+    if (!animeInfo) throw new Error('Could not fetch anime info from Anilist');
 
-  const hId = await searchAnime(null, animeInfo);
-  if (!hId) throw new Error('Match not found');
+    const title = animeInfo.title.english || animeInfo.title.romaji;
+    if (!title) throw new Error('No title found');
 
-  const episodeData = await getEpisodeIds(hId, anilistId);
+    const hianimeId = await searchAnime(title, animeInfo);
+    if (!hianimeId) throw new Error('Could not find anime on Hianime');
 
-  return {
-    ...animeInfo,
-    hianimeId: hId,
-    ...episodeData
-  };
+    const episodes = await getEpisodeIds(hianimeId, anilistId);
+    return { anilistId, hianimeId, title, ...episodes };
+  } catch (error) {
+    console.error('Error in getEpisodesForAnime:', error);
+    throw error;
+  }
 }
 
 export default { getEpisodesForAnime };
