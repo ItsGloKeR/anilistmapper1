@@ -7,7 +7,7 @@ import { ANILIST_URL, ANILIST_QUERY, HIANIME_URL, ANIZIP_URL } from '../constant
 const MANUAL_MAP = {
   // Attack on Titan Season 3 Part 2 (AniList: 10 episodes)
   '99147': {
-    hianimeId: 'attack-on-titan-season-3-162', 
+    hianimeId: 'attack-on-titan-season-3-85', 
     range: [12, 22] // Index 12 is Ep 13, up to Ep 22
   },
   // Attack on Titan Final Season THE FINAL CHAPTERS Special 1
