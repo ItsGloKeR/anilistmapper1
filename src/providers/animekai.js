@@ -2,7 +2,7 @@ import { load } from 'cheerio';
 import { client } from '../utils/client.js';
 
 const DEFAULT_BASE = 'https://anikai.to';
-const KAISVA_URL = 'https://ilovekai.simplepostrequest.workers.dev'; // Cloudflare Worker decoder
+const KAISVA_URL = 'https://ancient-wind-00be.itsgloker.workers.dev'; // Cloudflare Worker decoder
 
 function fixUrl(url, base = DEFAULT_BASE) {
   if (!url) return '';
