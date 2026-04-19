@@ -13,43 +13,32 @@ export async function extractKwik(kwikUrl) {
             headers: {
                 'User-Agent': kwikUserAgent,
                 'Referer': refinedReferer,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
             }
         });
 
-        // 1. More robust regex to find the packed function
+        // Regex to find the packed function and its arguments
         const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\).+?\}\((.+?)\)\s*\)/s);
         if (!packedMatch) {
             throw new Error("Could not find packed eval JS in Kwik page");
         }
 
-        // 2. Extract the arguments safely
-        // Instead of manual indexing, we split the arguments inside the payload
         const argsString = packedMatch[1];
         const parts = parsePackedArgs(argsString);
 
-        if (parts.length < 4) {
-            throw new Error("Invalid packed data format");
-        }
+        if (parts.length < 4) throw new Error("Invalid packed data format");
 
-        const p = parts[0].replace(/^'|'$/g, ""); // Remove wrapping quotes from p
+        const p = parts[0].replace(/^'|'$/g, ""); 
         const a = parseInt(parts[1], 10);
         const c = parseInt(parts[2], 10);
-        
-        // Handle the dictionary 'k' which is usually parts[3]
-        let k = parts[3].replace(/^'|'$/g, "").split('|');
+        const k = parts[3].replace(/^'|'$/g, "").split('|');
 
-        // 3. De-obfuscate
-        let decoded = unpackKwik(p, a, c, k);
+        const decoded = unpackKwik(p, a, c, k);
 
-        // 4. Extract the source URL
-        // Kwik usually embeds the source in a 'source=' or 'file:' format
+        // Find the source URL inside the decoded JS
         const srcMatch = decoded.match(/source\s*=\s*["'](https?:\/\/[^"']+)["']/i) || 
                          decoded.match(/file\s*:\s*["'](https?:\/\/[^"']+)["']/i);
 
-        if (!srcMatch) {
-            throw new Error("Could not find video URL in unpacked code");
-        }
+        if (!srcMatch) throw new Error("Could not find video URL in unpacked code");
 
         const videoURL = srcMatch[1].replace(/\\/g, "");
         
@@ -57,9 +46,7 @@ export async function extractKwik(kwikUrl) {
             url: videoURL,
             isM3U8: videoURL.includes(".m3u8"),
         };
-
     } catch (error) {
-        console.error("Kwik Extraction Error:", error.message);
         throw error;
     }
 }
