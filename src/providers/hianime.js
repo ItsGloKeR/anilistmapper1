@@ -21,7 +21,7 @@ const MANUAL_MAP = {
     range: [0, 1] 
   },
   // Final Chapters Special 2 (Part 3 Episode 2)
-  '164244': {
+  '162314': {
     hianimeId: 'attack-on-titan-the-final-season-part-3-18329',
     range: [1, 2] 
   }
