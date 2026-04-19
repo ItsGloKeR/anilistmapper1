@@ -3,6 +3,30 @@ import * as stringSimilarity from 'string-similarity-js';
 import { client } from '../utils/client.js';
 import { ANILIST_URL, ANILIST_QUERY, HIANIME_URL, ANIZIP_URL } from '../constants/api-constants.js';
 
+// --- MANUAL MAPPING TABLE ---
+const MANUAL_MAP = {
+  // Season 3 Part 1 (AniList: 12 episodes)
+  '99146': {
+    hianimeId: 'attack-on-titan-season-3-85', 
+    range: [0, 12] 
+  },
+  // Season 3 Part 2 (AniList: 10 episodes)
+  '104578': {
+    hianimeId: 'attack-on-titan-season-3-85', 
+    range: [12, 22] 
+  },
+  // Final Chapters Special 1 (Part 3 Episode 1)
+  '146903': {
+    hianimeId: 'attack-on-titan-the-final-season-part-3-18329',
+    range: [0, 1] 
+  },
+  // Final Chapters Special 2 (Part 3 Episode 2)
+  '164244': {
+    hianimeId: 'attack-on-titan-the-final-season-part-3-18329',
+    range: [1, 2] 
+  }
+};
+
 const TITLE_REPLACEMENTS = {
   'season': ['s', 'sz'],
   's': ['season', 'sz'],
@@ -24,7 +48,7 @@ const wordVariationsCache = new Map();
 
 const normalizeText = (text) => {
   return text.toLowerCase()
-    .replace(/(\d+)/g, ' $1 ') // Force space around numbers: "Rotten2" -> "rotten 2"
+    .replace(/(\d+)/g, ' $1 ') 
     .replace(/[^\w\s]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -87,13 +111,10 @@ const calculateTitleScore = (searchTitle, hianimeTitle) => {
 
   if (normalizedSearch === normalizedTitle) return 1;
 
-  // --- Strict Number Check ---
-  // Extract trailing numbers or specific season markers
   const getTrailingNum = (t) => t.match(/\d+$/)?.[0];
   const searchNum = getTrailingNum(normalizedSearch);
   const titleNum = getTrailingNum(normalizedTitle);
 
-  // If one has a trailing number and the other doesn't (Season 1 vs Season 2), penalize heavily
   if (searchNum !== titleNum) return 0.2;
 
   const searchWords = normalizedSearch.split(' ');
@@ -112,13 +133,17 @@ const calculateTitleScore = (searchTitle, hianimeTitle) => {
   const wordMatchScore = matches / Math.max(searchWords.length, titleWords.length);
   const similarity = stringSimilarity.stringSimilarity(normalizedSearch, normalizedTitle);
 
-  // Penalty for significant length mismatch (prevents "Angel" matching "Angel Next Door")
   const lengthRatio = Math.min(searchWords.length, titleWords.length) / Math.max(searchWords.length, titleWords.length);
 
   return ((wordMatchScore * 0.6) + (similarity * 0.4)) * lengthRatio;
 };
 
 async function searchAnime(title, animeInfo) {
+  // --- Check Manual Mapping First ---
+  if (MANUAL_MAP[animeInfo.id.toString()]) {
+    return MANUAL_MAP[animeInfo.id.toString()].hianimeId;
+  }
+
   try {
     let bestMatch = { score: 0, id: null };
     let seriesMatches = [];
@@ -158,7 +183,6 @@ async function searchAnime(title, animeInfo) {
         }
       });
 
-      // Threshold raised to 0.95 to ensure we don't grab "Season 2" by mistake
       if (bestMatch.score > 0.95) return bestMatch.id;
     }
 
@@ -179,7 +203,6 @@ async function getEpisodeIds(animeId, anilistId) {
     const episodeUrl = `${HIANIME_URL}/ajax/v2/episode/list/${animeId.split('-').pop()}`;
     const anizipUrl = `${ANIZIP_URL}?anilist_id=${anilistId}`;
 
-    // Use separate catch for Anizip so it doesn't break everything if it's down
     const [episodeResponse, anizipResponse] = await Promise.all([
       client.get(episodeUrl, {
         headers: { 'Referer': `${HIANIME_URL}/watch/${animeId}`, 'X-Requested-With': 'XMLHttpRequest' }
@@ -190,7 +213,7 @@ async function getEpisodeIds(animeId, anilistId) {
     if (!episodeResponse.data.html) return { totalEpisodes: 0, episodes: [] };
 
     const $ = load(episodeResponse.data.html);
-    const episodes = [];
+    let rawEpisodes = [];
     const anizipData = anizipResponse.data;
     
     $('#detail-ss-list div.ss-list a').each((i, el) => {
@@ -203,7 +226,7 @@ async function getEpisodeIds(animeId, anilistId) {
       const anizipEpisode = anizipData?.episodes?.[episodeNumber];
       
       if (fullPath) {
-        episodes.push({
+        rawEpisodes.push({
           episodeId: `${animeId}?ep=${fullPath.split('?ep=')[1]}`,
           title: anizipEpisode?.title?.en || $el.attr('title') || '',
           number: episodeNumber,
@@ -215,9 +238,21 @@ async function getEpisodeIds(animeId, anilistId) {
       }
     });
 
+    // --- Apply Manual Range Mapping ---
+    let finalEpisodes = rawEpisodes;
+    const manualEntry = MANUAL_MAP[anilistId.toString()];
+    
+    if (manualEntry && manualEntry.range) {
+      const [start, end] = manualEntry.range;
+      finalEpisodes = rawEpisodes.slice(start, end).map((ep, index) => ({
+        ...ep,
+        number: index + 1 // Re-index for the specific AniList entry (e.g., Ep 13 becomes Ep 1 for S3 Part 2)
+      }));
+    }
+
     return { 
-      totalEpisodes: episodes.length, 
-      episodes,
+      totalEpisodes: finalEpisodes.length, 
+      episodes: finalEpisodes,
       titles: anizipData?.titles || null,
       images: anizipData?.images || null
     };
