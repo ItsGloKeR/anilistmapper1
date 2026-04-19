@@ -139,7 +139,6 @@ const calculateTitleScore = (searchTitle, hianimeTitle) => {
 };
 
 async function searchAnime(title, animeInfo) {
-  // --- Check Manual Mapping First ---
   if (MANUAL_MAP[animeInfo.id.toString()]) {
     return MANUAL_MAP[animeInfo.id.toString()].hianimeId;
   }
@@ -222,12 +221,13 @@ async function getEpisodeIds(animeId, anilistId) {
       if (!href) return;
 
       const fullPath = href.split('/').pop();
+      const epParam = fullPath.split('?ep=')[1];
       const episodeNumber = i + 1;
       const anizipEpisode = anizipData?.episodes?.[episodeNumber];
       
-      if (fullPath) {
+      if (epParam) {
         rawEpisodes.push({
-          episodeId: `${animeId}?ep=${fullPath.split('?ep=')[1]}`,
+          epParam, // Store the specific episode ID parameter
           title: anizipEpisode?.title?.en || $el.attr('title') || '',
           number: episodeNumber,
           image: anizipEpisode?.image || null,
@@ -238,17 +238,27 @@ async function getEpisodeIds(animeId, anilistId) {
       }
     });
 
-    // --- Apply Manual Range Mapping ---
-    let finalEpisodes = rawEpisodes;
+    let finalEpisodes = [];
     const manualEntry = MANUAL_MAP[anilistId.toString()];
     
     if (manualEntry && manualEntry.range) {
       const [start, end] = manualEntry.range;
+      // Slice the full list and rebuild the IDs using the sliced item's specific epParam
       finalEpisodes = rawEpisodes.slice(start, end).map((ep, index) => ({
         ...ep,
-        number: index + 1 // Re-index for the specific AniList entry (e.g., Ep 13 becomes Ep 1 for S3 Part 2)
+        episodeId: `${animeId}?ep=${ep.epParam}`,
+        number: index + 1 // Keep display number as 1 for the specific special
+      }));
+    } else {
+      // Standard mapping
+      finalEpisodes = rawEpisodes.map(ep => ({
+        ...ep,
+        episodeId: `${animeId}?ep=${ep.epParam}`
       }));
     }
+
+    // Remove the temporary param
+    finalEpisodes.forEach(ep => delete ep.epParam);
 
     return { 
       totalEpisodes: finalEpisodes.length, 
