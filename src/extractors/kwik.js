@@ -2,18 +2,14 @@ import axios from 'axios';
 
 const kwikUserAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36";
 
-export async function extractKwik(kwikUrl, referer) {
-    if (!kwikUrl) {
-        throw new Error("missing kwik URL");
-    }
+export async function extractKwik(kwikUrl) {
+    if (!kwikUrl) throw new Error("Missing Kwik URL");
 
     try {
         const urlObj = new URL(kwikUrl);
-        // Always use the origin of the kwik URL as Referer, regardless of passed-in value
-        // mimicking: if u, err := url.Parse(kwikURL); err == nil { referer = u.Scheme + "://" + u.Host + "/" }
         const refinedReferer = `${urlObj.protocol}//${urlObj.host}/`;
 
-        const response = await axios.get(kwikUrl, {
+        const { data: html } = await axios.get(kwikUrl, {
             headers: {
                 'User-Agent': kwikUserAgent,
                 'Referer': refinedReferer,
@@ -21,153 +17,85 @@ export async function extractKwik(kwikUrl, referer) {
             }
         });
 
-        const html = response.data;
-
-        // Find the packed eval JS - look for eval(...) containing m3u8
-        const jsMatch = html.match(/;(eval\(function\(p,a,c,k,e,d\).*?m3u8.*?\)\))/);
-        if (!jsMatch || jsMatch.length < 2) {
-            throw new Error("could not find eval JS pattern in Kwik page");
+        // 1. More robust regex to find the packed function
+        const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\).+?\}\((.+?)\)\s*\)/s);
+        if (!packedMatch) {
+            throw new Error("Could not find packed eval JS in Kwik page");
         }
 
-        const jsCode = jsMatch[1];
+        // 2. Extract the arguments safely
+        // Instead of manual indexing, we split the arguments inside the payload
+        const argsString = packedMatch[1];
+        const parts = parsePackedArgs(argsString);
 
-        const lastBraceIdx = jsCode.lastIndexOf("}(");
-        if (lastBraceIdx === -1) {
-            throw new Error("could not find argument start marker '}('");
-        }
-
-        const endIdx = jsCode.lastIndexOf("))");
-        if (endIdx === -1 || endIdx <= lastBraceIdx) {
-            throw new Error("could not find argument end marker '))'");
-        }
-
-        const stripped = jsCode.substring(lastBraceIdx + 2, endIdx);
-
-        const parts = parsePackedArgs(stripped);
         if (parts.length < 4) {
-            throw new Error(`invalid packed data: expected at least 4 parts, got ${parts.length}`);
+            throw new Error("Invalid packed data format");
         }
 
-        const p = parts[0];
+        const p = parts[0].replace(/^'|'$/g, ""); // Remove wrapping quotes from p
         const a = parseInt(parts[1], 10);
         const c = parseInt(parts[2], 10);
+        
+        // Handle the dictionary 'k' which is usually parts[3]
+        let k = parts[3].replace(/^'|'$/g, "").split('|');
 
-        let kStr = parts[3];
-        kStr = kStr.replace(/\.split\(['"]\|['"]\)$/, "");
-        const k = kStr.split("|");
-
+        // 3. De-obfuscate
         let decoded = unpackKwik(p, a, c, k);
 
-        decoded = decoded.replace(/\\/g, "");
-        decoded = decoded.replace("https.split(://", "https://");
-        decoded = decoded.replace("http.split(://", "http://");
+        // 4. Extract the source URL
+        // Kwik usually embeds the source in a 'source=' or 'file:' format
+        const srcMatch = decoded.match(/source\s*=\s*["'](https?:\/\/[^"']+)["']/i) || 
+                         decoded.match(/file\s*:\s*["'](https?:\/\/[^"']+)["']/i);
 
-        const srcMatch = decoded.match(/source=(https?:\/\/[^;]+)/);
-        if (!srcMatch || srcMatch.length < 2) {
-            throw new Error("could not find video URL in unpacked code");
+        if (!srcMatch) {
+            throw new Error("Could not find video URL in unpacked code");
         }
 
-        const videoURL = cleanKwikURL(srcMatch[1]);
+        const videoURL = srcMatch[1].replace(/\\/g, "");
+        
         return {
             url: videoURL,
             isM3U8: videoURL.includes(".m3u8"),
         };
 
     } catch (error) {
+        console.error("Kwik Extraction Error:", error.message);
         throw error;
     }
 }
 
 function unpackKwik(p, a, c, k) {
-    const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-    const dict = {};
-
-    function baseEncode(n) {
-        const rem = n % a;
-        let digit;
-        if (rem > 35) {
-            digit = String.fromCharCode(rem + 29);
-        } else {
-            digit = digits[rem];
-        }
-
-        if (n < a) {
-            return digit;
-        }
-        return baseEncode(Math.floor(n / a)) + digit;
-    }
-
-    for (let i = c - 1; i >= 0; i--) {
-        const key = baseEncode(i);
-        if (i < k.length && k[i] !== "") {
-            dict[key] = k[i];
-        } else {
-            dict[key] = key;
+    while (c--) {
+        if (k[c]) {
+            p = p.replace(new RegExp('\\b' + c.toString(a) + '\\b', 'g'), k[c]);
         }
     }
-
-    // Use regex to replace words
-    return p.replace(/\b\w+\b/g, (w) => {
-        if (Object.prototype.hasOwnProperty.call(dict, w)) {
-            return dict[w];
-        }
-        return w;
-    });
+    return p;
 }
 
 function parsePackedArgs(input) {
     const result = [];
-    let inQuote = false;
-    let quoteChar = null;
-    let depth = 0;
     let current = "";
+    let inQuote = false;
+    let quoteChar = "";
 
     for (let i = 0; i < input.length; i++) {
-        const r = input[i];
-
-        if (!inQuote) {
-            if (r === '\'' || r === '"') {
+        const char = input[i];
+        if ((char === "'" || char === '"') && input[i - 1] !== "\\") {
+            if (!inQuote) {
                 inQuote = true;
-                quoteChar = r;
-                // Don't add quote to current, mimicking Go logic 'continue'
-                continue;
-            }
-            if (r === ',' && depth === 0) {
-                result.push(current.trim());
-                current = "";
-                continue;
-            }
-            if (r === '(' || r === '[' || r === '{') {
-                depth++;
-            } else if (r === ')' || r === ']' || r === '}') {
-                if (depth > 0) {
-                    depth--;
-                }
-            }
-        } else {
-            if (r === quoteChar) {
+                quoteChar = char;
+            } else if (char === quoteChar) {
                 inQuote = false;
-                // Don't add quote to current
-                continue;
             }
         }
-        current += r;
+        if (char === "," && !inQuote) {
+            result.push(current.trim());
+            current = "";
+        } else {
+            current += char;
+        }
     }
-    if (current !== "") {
-        result.push(current.trim());
-    }
+    result.push(current.trim());
     return result;
-}
-
-function cleanKwikURL(u) {
-    u = u.replace(/\\\//g, "/");
-    u = u.replace(/^["']|["']$/g, ''); // Trim quotes
-    u = u.replace(/[\n\r\t ]/g, ''); // Trim whitespace chars
-
-    // Remove semicolon and anything after it
-    const idx = u.indexOf(";");
-    if (idx !== -1) {
-        u = u.substring(0, idx);
-    }
-    return u;
 }
