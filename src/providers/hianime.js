@@ -3,7 +3,7 @@ import * as stringSimilarity from 'string-similarity-js';
 import { client } from '../utils/client.js';
 import { ANILIST_URL, ANILIST_QUERY, HIANIME_URL, ANIZIP_URL } from '../constants/api-constants.js';
 
-// --- MANUAL MAPPING (AOT EXCEPTIONS) ---
+// --- MANUAL MAPPING (The Surgical Override for AOT) ---
 const MANUAL_MAP = {
   '99146': { hianimeId: 'attack-on-titan-season-3-85', range: [0, 12] },
   '104578': { hianimeId: 'attack-on-titan-season-3-85', range: [12, 22] },
@@ -11,6 +11,7 @@ const MANUAL_MAP = {
   '164244': { hianimeId: 'attack-on-titan-the-final-season-part-3-18329', range: [1, 2] }
 };
 
+// --- THE "OLD LOGIC" (Title Variations & Scoring) ---
 const TITLE_REPLACEMENTS = {
   'season': ['s', 'sz'],
   's': ['season', 'sz'],
@@ -30,10 +31,9 @@ const TITLE_REPLACEMENTS = {
 
 const wordVariationsCache = new Map();
 
-// --- UNIVERSAL LOGIC ---
 const normalizeText = (text) => {
   return text?.toLowerCase()
-    .replace(/(\d+)/g, ' $1 ')
+    .replace(/(\d+)/g, ' $1 ') 
     .replace(/[^\w\s]/g, '')
     .replace(/\s+/g, ' ')
     .trim() || '';
@@ -65,11 +65,9 @@ const calculateTitleScore = (searchTitle, hianimeTitle) => {
 
   if (normalizedSearch === normalizedTitle) return 1;
 
+  // Strict Number Check
   const getTrailingNum = (t) => t.match(/\d+$/)?.[0];
-  const searchNum = getTrailingNum(normalizedSearch);
-  const titleNum = getTrailingNum(normalizedTitle);
-
-  if (searchNum !== titleNum) return 0.2;
+  if (getTrailingNum(normalizedSearch) !== getTrailingNum(normalizedTitle)) return 0.2;
 
   const searchWords = normalizedSearch.split(' ');
   const titleWords = normalizedTitle.split(' ');
@@ -89,60 +87,69 @@ const calculateTitleScore = (searchTitle, hianimeTitle) => {
   return ((wordMatchScore * 0.6) + (similarity * 0.4)) * lengthRatio;
 };
 
-// --- CORE SCRAPING ---
+// --- ANILIST INFO (Including Assets) ---
 async function getAnimeInfo(anilistId) {
+  const query = `
+    query ($id: Int) {
+      Media (id: $id, type: ANIME) {
+        id
+        title { english romaji }
+        coverImage { extraLarge color }
+        bannerImage
+        synonyms
+        episodes
+        description
+      }
+    }
+  `;
+
   try {
-    const response = await client.post(ANILIST_URL, {
-      query: ANILIST_QUERY,
-      variables: { id: anilistId }
-    });
-    const animeData = response.data.data.Media;
-    if (!animeData) return null;
+    const response = await client.post(ANILIST_URL, { query, variables: { id: parseInt(anilistId) } });
+    const media = response.data.data.Media;
+    if (!media) return null;
+
     const allTitles = new Set([
-      ...(animeData.synonyms || []),
-      animeData.title.english,
-      animeData.title.romaji
+      ...(media.synonyms || []),
+      media.title.english,
+      media.title.romaji
     ].filter(Boolean).filter(t => !(/[\u4E00-\u9FFF]/.test(t))));
 
-    return { id: animeData.id, title: animeData.title, episodes: animeData.episodes, synonyms: [...allTitles] };
+    return {
+      id: media.id,
+      title: media.title,
+      banner: media.bannerImage,
+      cover: media.coverImage.extraLarge,
+      color: media.coverImage.color,
+      episodes: media.episodes,
+      synonyms: [...allTitles],
+      description: media.description
+    };
   } catch { return null; }
 }
 
+// --- SEARCH & EPISODE LOGIC ---
 async function searchAnime(title, animeInfo) {
+  // Manual map check first
   if (MANUAL_MAP[animeInfo.id.toString()]) return MANUAL_MAP[animeInfo.id.toString()].hianimeId;
 
   try {
     let bestMatch = { score: 0, id: null };
-    let seriesMatches = [];
     const titlesToTry = [animeInfo.title.english, animeInfo.title.romaji, ...animeInfo.synonyms]
       .filter(Boolean).filter((t, i, arr) => arr.indexOf(t) === i);
 
     for (const searchTitle of titlesToTry) {
-      const searchUrl = `${HIANIME_URL}/search?keyword=${encodeURIComponent(searchTitle)}`;
-      const response = await client.get(searchUrl);
+      const response = await client.get(`${HIANIME_URL}/search?keyword=${encodeURIComponent(searchTitle)}`);
       const $ = load(response.data);
 
-      $('.film_list-wrap > .flw-item').each((_, item) => {
-        const el = $(item).find('.film-detail .film-name a');
+      $('.flw-item').each((_, item) => {
+        const el = $(item).find('.film-name a');
         const hTitle = el.text().trim();
         const hId = el.attr('href')?.split('/').pop()?.split('?')[0];
-        const isTV = $(item).find('.fd-infor .fdi-item').first().text().trim() === 'TV';
-        const episodesCount = parseInt($(item).find('.tick-item.tick-eps').text().trim()) || 0;
-
-        if (hId) {
-          let score = calculateTitleScore(searchTitle, hTitle);
-          if (isTV && animeInfo.episodes > 12) score += 0.05;
-          if (animeInfo.episodes && episodesCount === animeInfo.episodes) score += 0.1;
-
-          if (score > 0.4) seriesMatches.push({ id: hId, score });
-          if (score > bestMatch.score) bestMatch = { score, id: hId };
-        }
+        
+        const score = calculateTitleScore(searchTitle, hTitle);
+        if (score > bestMatch.score) bestMatch = { score, id: hId };
       });
       if (bestMatch.score > 0.95) break;
-    }
-    if (seriesMatches.length > 0) {
-      seriesMatches.sort((a, b) => b.score - a.score);
-      return seriesMatches[0].id;
     }
     return bestMatch.score > 0.5 ? bestMatch.id : null;
   } catch { return null; }
@@ -151,17 +158,15 @@ async function searchAnime(title, animeInfo) {
 async function getEpisodeIds(hianimeId, anilistId) {
   try {
     const numericId = hianimeId.split('-').pop();
-    const episodeUrl = `${HIANIME_URL}/ajax/v2/episode/list/${numericId}`;
-    const anizipUrl = `${ANIZIP_URL}?anilist_id=${anilistId}`;
-
-    const [episodeResponse, anizipResponse] = await Promise.all([
-      client.get(episodeUrl, { headers: { 'Referer': `${HIANIME_URL}/watch/${hianimeId}`, 'X-Requested-With': 'XMLHttpRequest' } }),
-      client.get(anizipUrl).catch(() => ({ data: null }))
+    const [epRes, azRes] = await Promise.all([
+      client.get(`${HIANIME_URL}/ajax/v2/episode/list/${numericId}`, {
+        headers: { 'Referer': `${HIANIME_URL}/watch/${hianimeId}`, 'X-Requested-With': 'XMLHttpRequest' }
+      }),
+      client.get(`${ANIZIP_URL}?anilist_id=${anilistId}`).catch(() => ({ data: null }))
     ]);
 
-    if (!episodeResponse.data.html) return { totalEpisodes: 0, episodes: [] };
-    const $ = load(episodeResponse.data.html);
-    const anizipData = anizipResponse.data;
+    if (!epRes.data.html) return { totalEpisodes: 0, episodes: [] };
+    const $ = load(epRes.data.html);
     let allEpisodes = [];
 
     $('.ss-list a.ep-item').each((i, el) => {
@@ -169,30 +174,23 @@ async function getEpisodeIds(hianimeId, anilistId) {
       if (href && href.includes('?ep=')) {
         allEpisodes.push({
           episodeId: `${hianimeId}?ep=${href.split('?ep=')[1]}`,
-          originalIndex: i + 1,
           title: $(el).attr('title') || `Episode ${i + 1}`
         });
       }
     });
 
-    // --- APPLY AOT RANGE LOGIC ---
-    let finalEpisodes = allEpisodes;
     const mapEntry = MANUAL_MAP[anilistId.toString()];
-    if (mapEntry && mapEntry.range) {
-      finalEpisodes = allEpisodes.slice(mapEntry.range[0], mapEntry.range[1]);
-    }
+    const finalEpisodes = mapEntry?.range ? allEpisodes.slice(mapEntry.range[0], mapEntry.range[1]) : allEpisodes;
 
     const episodesWithMeta = finalEpisodes.map((ep, idx) => {
       const displayNum = idx + 1;
-      const meta = anizipData?.episodes?.[displayNum];
+      const meta = azRes.data?.episodes?.[displayNum];
       return {
         ...ep,
         number: displayNum,
         title: meta?.title?.en || ep.title,
         image: meta?.image || null,
-        overview: meta?.overview || null,
-        airDate: meta?.airDate || null,
-        runtime: meta?.runtime || null
+        overview: meta?.overview || null
       };
     });
 
@@ -204,11 +202,16 @@ export async function getEpisodesForAnime(anilistId) {
   const animeInfo = await getAnimeInfo(anilistId);
   if (!animeInfo) throw new Error('AniList Data Failed');
 
-  const hianimeId = await searchAnime(animeInfo.title.english || animeInfo.title.romaji, animeInfo);
-  if (!hianimeId) throw new Error('HiAnime ID not found');
+  const hId = await searchAnime(null, animeInfo);
+  if (!hId) throw new Error('Match not found');
 
-  const episodes = await getEpisodeIds(hianimeId, anilistId);
-  return { anilistId, hianimeId, title: animeInfo.title.english || animeInfo.title.romaji, ...episodes };
+  const episodeData = await getEpisodeIds(hId, anilistId);
+
+  return {
+    ...animeInfo,
+    hianimeId: hId,
+    ...episodeData
+  };
 }
 
 export default { getEpisodesForAnime };
