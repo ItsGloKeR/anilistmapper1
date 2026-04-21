@@ -14,7 +14,7 @@ export const ANILIST_QUERY = `
     }
   }
 `;
-export const HIANIME_URL = 'https://hianime.ws';
+export const HIANIME_URL = 'https://aniwatchtv.to';
 export const ANIZIP_URL = 'https://api.ani.zip/mappings';
 
 export default {
